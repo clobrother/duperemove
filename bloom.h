@@ -105,7 +105,7 @@ int bloom_check(struct bloom *bloom, void *buffer, int len);
  *    -1 - bloom not initialized
  *
  */
-int bloom_add(struct bloom *bloom, void *buffer, int len);
+int bloom_add(struct bloom *bloom, const void *buffer, int len);
 
 
 /** ***************************************************************************

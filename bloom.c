@@ -23,7 +23,7 @@
 #include "csum.h"
 
 static int bloom_check_add(struct bloom *bloom,
-			void *buffer, int len, int add)
+			const void *buffer, int len, int add)
 {
 	if (bloom->ready == 0) {
 		fprintf(stderr, "bloom is not initialized!\n");
@@ -107,18 +107,15 @@ int bloom_init(struct bloom *bloom, int entries, double error)
 	return 0;
 }
 
-
 int bloom_check(struct bloom *bloom, void *buffer, int len)
 {
 	return bloom_check_add(bloom, buffer, len, 0);
 }
 
-
-int bloom_add(struct bloom *bloom, void *buffer, int len)
+int bloom_add(struct bloom *bloom, const void *buffer, int len)
 {
 	return bloom_check_add(bloom, buffer, len, 1);
 }
-
 
 void bloom_print(struct bloom *bloom)
 {

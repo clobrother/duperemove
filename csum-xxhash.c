@@ -32,7 +32,8 @@ static int xxhash_init_hash(unsigned int *ret_digest_len)
 	return 0;
 }
 
-static void xxhash_checksum_block(char *buf, int len, unsigned char *digest) {
+static void xxhash_checksum_block(const char *buf, int len,
+				  unsigned char *digest) {
 	unsigned long long *hash = (unsigned long long*)digest;
 	/*
 	 * For xxhash one use only first 64 bit from 256 bit hash field

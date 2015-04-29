@@ -28,7 +28,8 @@
 #define	HASH_TYPE_SHA256	"SHA256  "
 #define DIGEST_LEN_SHA256	32
 
-static void sha256_checksum_block(char *buf, int len, unsigned char *digest)
+static void sha256_checksum_block(const char *buf, int len,
+				  unsigned char *digest)
 {
 	sha256((unsigned char *)buf, len, digest, 0);
 }

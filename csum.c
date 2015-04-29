@@ -75,7 +75,7 @@ void debug_print_digest(FILE *stream, unsigned char *digest)
 		fprintf(stream, "%.2x", digest[i]);
 }
 
-void checksum_block(char *buf, int len, unsigned char *digest)
+void checksum_block(const char *buf, int len, unsigned char *digest)
 {
 	csum_mod->ops->checksum_block(buf, len, digest);
 }

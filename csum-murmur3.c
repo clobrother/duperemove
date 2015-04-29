@@ -257,7 +257,8 @@ static void murmur3_finish_running_checksum(struct running_checksum *_c,
 	free(c);
 }
 
-static void murmur3_checksum_block(char *buf, int len, unsigned char *digest)
+static void murmur3_checksum_block(const char *buf, int len,
+				   unsigned char *digest)
 {
 	struct running_checksum *csum = murmur3_start_running_checksum();
 	murmur3_add_to_running_checksum(csum, len, (unsigned char*)buf);
