@@ -11,9 +11,9 @@ struct d_tree {
 };
 
 /* alloc and insert a new digest into the tree */
-int digest_insert(struct rb_root *root, unsigned char *digest);
+int digest_insert(struct rb_root *root, const unsigned char *digest);
 struct d_tree *digest_find(struct rb_root *root,
-			   unsigned char *digest);
+			   const unsigned char *digest);
 
 uint64_t digest_count(struct rb_root *root);
 void digest_free(struct rb_root *root);

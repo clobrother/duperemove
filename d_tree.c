@@ -21,7 +21,7 @@
 #include "d_tree.h"
 #include "debug.h"
 
-static struct d_tree *digest_new(unsigned char *digest)
+static struct d_tree *digest_new(const unsigned char *digest)
 {
 	struct d_tree *token = malloc(sizeof(struct d_tree));
 
@@ -37,7 +37,7 @@ static struct d_tree *digest_new(unsigned char *digest)
 	return token;
 }
 
-int digest_insert(struct rb_root *root, unsigned char *digest)
+int digest_insert(struct rb_root *root, const unsigned char *digest)
 {
 	struct d_tree *token;
 	struct rb_node **p = &root->rb_node;
@@ -71,7 +71,7 @@ int digest_insert(struct rb_root *root, unsigned char *digest)
 }
 
 struct d_tree *digest_find(struct rb_root *root,
-				unsigned char *digest)
+			   const unsigned char *digest)
 {
 	if (!root)
 		return NULL;
