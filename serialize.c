@@ -24,8 +24,6 @@
 #include "bloom.h"
 #include "d_tree.h"
 
-#define FILENAME "/home/jack/test.db"
-
 sqlite3_stmt *ins_hash_stmt = NULL;
 sqlite3_stmt *ins_file_stmt = NULL;
 sqlite3_stmt *sel_hash_stmt = NULL;
@@ -65,34 +63,39 @@ static int open_db(char *filename)
  * Make the db faster (& risky), for initial insertions.
  * TODO: for sane updates, switch off these for a safer state
  */
-static void burst_db(void)
+static int burst_db(void)
 {
-	exec_query("PRAGMA synchronous = OFF");
-	exec_query("PRAGMA journal_mode = MEMORY");
+	if (exec_query("PRAGMA synchronous = OFF") != 0
+	 || exec_query("PRAGMA journal_mode = MEMORY"))
+		return -1;
+	return 0;
 }
 
-static void create_tables(void)
+static int create_tables(void)
 {
 	char *sql;
+	int ret;
 	sql = "create table if not exists file_info (\
 		id integer primary key,\
 		inum int,\
 		subvolid int,\
 		num_blocks int,\
 		filename text);";
-	exec_query(sql);
+	ret = exec_query(sql);
 
 	sql = "create table if not exists hashes (\
 		file_id int,\
 		digest text,\
 		flags int,\
 		loff int);";
-	exec_query(sql);
+	ret |= exec_query(sql);
 
 	sql = "create table if not exists config (\
 		key text,\
 		value int);";
-	exec_query(sql);
+	ret |= exec_query(sql);
+
+	return ret;
 }
 
 static void free_stmt(void)
@@ -150,16 +153,10 @@ static void close_db(void)
 	sqlite3_close(db);
 }
 
-int init_db(void)
+int init_db(char *filename)
 {
-	open_db(FILENAME);
-
-	burst_db();
-	create_tables();
-	compile_stmt();
-
-	atexit(close_db);
-	return 0;
+	return (open_db(filename) || burst_db() || create_tables()
+		|| compile_stmt() || atexit(close_db));
 }
 
 int write_file_info(struct filerec *file)

@@ -257,7 +257,6 @@ int main(int argc, char **argv)
 
 	init_filerec();
 	init_hash_tree(&tree);
-	init_db();
 
 	if (parse_options(argc, argv)) {
 		usage(argv[0]);
@@ -266,6 +265,10 @@ int main(int argc, char **argv)
 
 	if (init_csum_module(DEFAULT_HASH_STR))
 		return ENOMEM;
+
+	ret = init_db(serialize_fname);
+	if (ret)
+		return ret;
 
 	ret = read_hash_tree(serialize_fname, &tree, &blocksize, &h, 0, NULL);
 	if (ret) {

@@ -324,7 +324,10 @@ int main(int argc, char **argv)
 	printf("Using %uK blocks\n", blocksize / 1024);
 	printf("Using hash: %s\n", csum_mod->name);
 
-	init_db();
+	ret = init_db(serialize_fname);
+	if (ret)
+		return ret;
+
 	switch (use_hashfile) {
 	case H_WRITE:
 	case H_UPDATE:

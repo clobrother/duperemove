@@ -16,7 +16,7 @@ struct db_header {
 /* IMPORTANT: you should not use that without mutex */
 sqlite3 *db;
 
-int init_db(void);
+int init_db(char *filename);
 int write_file_info(struct filerec *file);
 int write_one_hash(uint64_t loff, uint32_t flags, unsigned char *digest);
 int read_hash_tree(char *filename, struct hash_tree *tree,
