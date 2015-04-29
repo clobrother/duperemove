@@ -166,12 +166,10 @@ static void print_filerecs(void)
 }
 
 static void print_file_info(struct hash_tree *tree,
-			    struct hash_file_header *h)
+			    struct db_header *h)
 {
 	printf("Raw header info for \"%s\":\n", serialize_fname);
-	printf("  version: %"PRIu64".%"PRIu64"\tblock_size: %u\n",
-	       le64_to_cpu(h->major), le64_to_cpu(h->minor),
-	       le32_to_cpu(h->block_size));
+	printf("\tblock_size: %u\n", h->block_size);
 	printf("  num_files: %"PRIu64"\tnum_hashes: %"PRIu64"\n",
 	       le64_to_cpu(h->num_files), le64_to_cpu(h->num_hashes));
 	printf("Loaded hashes from %"PRIu64" blocks into %"PRIu64" nodes\n",
@@ -255,10 +253,11 @@ int main(int argc, char **argv)
 {
 	int ret;
 	struct hash_tree tree;
-	struct hash_file_header h;
+	struct db_header h;
 
 	init_filerec();
 	init_hash_tree(&tree);
+	init_db();
 
 	if (parse_options(argc, argv)) {
 		usage(argv[0]);
@@ -270,7 +269,7 @@ int main(int argc, char **argv)
 
 	ret = read_hash_tree(serialize_fname, &tree, &blocksize, &h, 0, NULL);
 	if (ret) {
-		print_hash_tree_errcode(stderr, serialize_fname, ret);
+//		print_hash_tree_errcode(stderr, serialize_fname, ret);
 		return ret;
 	}
 

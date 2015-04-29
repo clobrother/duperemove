@@ -1,8 +1,6 @@
 /*
  * serialize.c
  *
- * Copyright (C) 2014 SUSE.  All rights reserved.
- *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public
  * License version 2 as published by the Free Software Foundation.
@@ -13,362 +11,405 @@
  * General Public License for more details.
  */
 
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <errno.h>
 #include <string.h>
-#include <stdint.h>
+#include <assert.h>
+#include <stdbool.h>
+#include <errno.h>
 #include <inttypes.h>
-#include <stddef.h>
-#include <limits.h>
-#include <endian.h>
-#include <byteswap.h>
 
-#include "kernel.h"
-#include "rbtree.h"
-#include "list.h"
-#include "debug.h"
-
-#include "csum.h"
-#include "filerec.h"
 #include "hash-tree.h"
-#include "bloom.h"
-
 #include "serialize.h"
+#include "debug.h"
+#include "bloom.h"
+#include "d_tree.h"
 
-#include "bswap.h"
+#define FILENAME "/home/jack/test.db"
 
-char unknown_hash_type[8];
-#define	hash_type_v1_0	"\0\0\0\0\0\0\0\0"
+sqlite3_stmt *ins_hash_stmt = NULL;
+sqlite3_stmt *ins_file_stmt = NULL;
+sqlite3_stmt *sel_hash_stmt = NULL;
+sqlite3_stmt *sel_file_stmt = NULL;
+
+sqlite3_int64 last_inserted = 0;
 
 struct bloom bloom;
 
-static void debug_print_header(struct hash_file_header *h)
+static int exec_query(char *sql)
 {
-	dprintf("Disk Header Info: [ ");
-	dprintf("magic: %.*s\t", 8, h->magic);
-	dprintf("major: %"PRIu64"\t", le64_to_cpu(h->major));
-	dprintf("minor: %"PRIu64"\t", le64_to_cpu(h->minor));
-	dprintf("num_files: %"PRIu64"\t", le64_to_cpu(h->num_files));
-	dprintf("num_hashes: %"PRIu64"\t", le64_to_cpu(h->num_hashes));
-	dprintf("block_size: %u\t", le32_to_cpu(h->block_size));
-	dprintf("hash_type: %.*s\t", 8, h->hash_type);
-	dprintf(" ]\n");
+	int ret;
+	char *err;
+
+	ret = sqlite3_exec(db, sql, NULL, NULL, &err);
+	if (ret != SQLITE_OK) {
+		printf("exec_query: %s\n", err);
+		sqlite3_free(err);
+		return -1;
+	}
+	dprintf("query executed successfully: %s\n", sql);
+	return 0;
 }
 
-static void debug_print_file_info(struct file_info *f)
+static int open_db(char *filename)
 {
-	unsigned int name_len = le16_to_cpu(f->name_len);
-
-	dprintf("Disk File Info: [ ");
-	dprintf("ino: %"PRIu64"\t", le64_to_cpu(f->ino));
-	dprintf("file_size: %"PRIu64"\t", le64_to_cpu(f->file_size));
-	dprintf("num_blocks: %"PRIu64"\t", le64_to_cpu(f->num_blocks));
-	dprintf("rec_len: %u\t", le16_to_cpu(f->rec_len));
-	dprintf("name_len: %u\t", name_len);
-	dprintf("name: \"%.*s\"\t", name_len, f->name);
-	dprintf(" ]\n");
+	int ret;
+	ret = sqlite3_open(filename, &db);
+	if (ret) {
+		fprintf(stderr, "sqlite3_open: %s\n", sqlite3_errmsg(db));
+		return -1;
+	}
+	return 0;
 }
 
-int write_header(int fd, uint64_t num_files, uint64_t num_hashes,
-			uint32_t block_size)
+/*
+ * Make the db faster (& risky), for initial insertions.
+ * TODO: for sane updates, switch off these for a safer state
+ */
+static void burst_db(void)
 {
-	int written;
-	int ret = 0;
-	loff_t err;
-	struct hash_file_header *disk = calloc(1, sizeof(*disk));
+	exec_query("PRAGMA synchronous = OFF");
+	exec_query("PRAGMA journal_mode = MEMORY");
+}
 
-	if (!disk)
-		return ENOMEM;
+static void create_tables(void)
+{
+	char *sql;
+	sql = "create table if not exists file_info (\
+		id integer primary key,\
+		inum int,\
+		subvolid int,\
+		num_blocks int,\
+		filename text);";
+	exec_query(sql);
 
-	memcpy(disk->magic, HASH_FILE_MAGIC, 8);
-	disk->major = cpu_to_le64(HASH_FILE_MAJOR);
-	disk->minor = cpu_to_le64(HASH_FILE_MINOR);
-	disk->num_files = cpu_to_le64(num_files);
-	disk->num_hashes = cpu_to_le64(num_hashes);
-	disk->block_size = cpu_to_le32(block_size);
-	memcpy(disk->hash_type, hash_type, 8);
+	sql = "create table if not exists hashes (\
+		file_id int,\
+		digest text,\
+		flags int,\
+		loff int);";
+	exec_query(sql);
 
-	err = lseek(fd, 0, SEEK_SET);
-	if (err == (loff_t)-1) {
-		ret = errno;
+	sql = "create table if not exists config (\
+		key text,\
+		value int);";
+	exec_query(sql);
+}
+
+static void free_stmt(void)
+{
+	sqlite3_finalize(ins_hash_stmt);
+	sqlite3_finalize(ins_file_stmt);
+	sqlite3_finalize(sel_hash_stmt);
+	sqlite3_finalize(sel_file_stmt);
+}
+
+static int compile_stmt(void)
+{
+	int ret;
+
+	char *ins_file_sql = "insert into file_info (\
+			      id, inum, subvolid, num_blocks, filename)\
+			      values(NULL, ?, ?, ?, ?);";
+
+	char *ins_hash_sql = "insert into hashes (\
+			      file_id, digest, flags, loff)\
+			      values(?, ?, ?, ?);";
+
+	char *sel_hash_sql = "select digest, flags, loff\
+			      from hashes where file_id = ?";
+	char *sel_file_sql = "select id, inum, subvolid, num_blocks, filename\
+			      from file_info";
+
+	ret = sqlite3_prepare_v2(db, ins_hash_sql, -1, &ins_hash_stmt, NULL);
+	ret |= sqlite3_prepare_v2(db, ins_file_sql, -1, &ins_file_stmt, NULL);
+	ret |= sqlite3_prepare_v2(db, sel_hash_sql, -1, &sel_hash_stmt, NULL);
+	ret |= sqlite3_prepare_v2(db, sel_file_sql, -1, &sel_file_stmt, NULL);
+	if (ret == SQLITE_OK)
+		return 0;
+
+	fprintf(stderr, "stmt compilation failed: %s\n", sqlite3_errstr(ret));
+	free_stmt();
+	return -1;
+}
+
+void db_begin_transac(void)
+{
+	char *sql = "begin transaction";
+	exec_query(sql);
+}
+
+void db_commit(void)
+{
+	char *sql = "end transaction";
+	exec_query(sql);
+}
+
+static void close_db(void)
+{
+	free_stmt();
+	sqlite3_close(db);
+}
+
+int init_db(void)
+{
+	open_db(FILENAME);
+
+	burst_db();
+	create_tables();
+	compile_stmt();
+
+	atexit(close_db);
+	return 0;
+}
+
+int write_file_info(struct filerec *file)
+{
+	int ret, result = 0;
+
+	ret = sqlite3_bind_int64(ins_file_stmt, 1, (sqlite3_int64)file->inum);
+	ret |= sqlite3_bind_int64(ins_file_stmt, 2, (sqlite3_int64)0);
+	ret |= sqlite3_bind_int64(ins_file_stmt, 3, (sqlite3_int64)file->num_blocks);
+	ret |= sqlite3_bind_text(ins_file_stmt, 4, file->filename,
+				 strlen(file->filename), SQLITE_TRANSIENT);
+	if (ret != SQLITE_OK) {
+		fprintf(stderr, "bind failed: %s\n", sqlite3_errstr(ret));
+		result = -1;
 		goto out;
 	}
 
-	written = write(fd, disk, sizeof(struct hash_file_header));
-	if (written == -1) {
-		ret = errno;
+	ret = sqlite3_step(ins_file_stmt);
+	if (ret != SQLITE_DONE) {
+		fprintf(stderr, "step failed: %s\n", sqlite3_errstr(ret));
+		result = -1;
 		goto out;
 	}
-	if (written != sizeof(struct hash_file_header)) {
-		ret = EIO;
-		goto out;
-	}
+
+	last_inserted = sqlite3_last_insert_rowid(db);
 
 out:
-	free(disk);
+	sqlite3_reset(ins_file_stmt);
+	return result;
+}
+
+
+int write_one_hash(uint64_t loff, uint32_t flags, unsigned char *digest)
+{
+	int ret;
+
+	ret = sqlite3_bind_int64(ins_hash_stmt, 1, last_inserted);
+	ret |= sqlite3_bind_text(ins_hash_stmt, 2, (char*)digest,
+				 DIGEST_LEN_MAX, SQLITE_TRANSIENT);
+	ret |= sqlite3_bind_int64(ins_hash_stmt, 3, (sqlite3_int64)flags);
+	ret |= sqlite3_bind_int64(ins_hash_stmt, 4, (sqlite3_int64)loff);
+	if (ret != SQLITE_OK) {
+		fprintf(stderr, "bind failed: %s\n", sqlite3_errstr(ret));
+		ret = -1;
+		goto out;
+	}
+
+	if (sqlite3_step(ins_hash_stmt) != SQLITE_DONE) {
+		fprintf(stderr, "step failed: %s\n", sqlite3_errstr(ret));
+		ret = -1;
+		goto out;
+	}
+	ret = 0;
+
+out:
+	sqlite3_reset(ins_hash_stmt);
 	return ret;
 }
 
-int write_file_info(int fd, struct filerec *file)
+static int select_file(uint64_t *id, uint64_t *inum, uint64_t *subvolid,
+		       const unsigned char **filename)
 {
-	int written, name_len;
-	struct file_info finfo = { 0, };
-	char *n;
+	int ret, result = 1;
 
-	finfo.ino = cpu_to_le64(file->inum);
-	finfo.file_size = 0ULL; /* We don't store this yet */
-	finfo.num_blocks = cpu_to_le64(file->num_blocks);
-	finfo.subvolid = cpu_to_le64(file->subvolid);
+	ret = sqlite3_step(sel_file_stmt);
+	if (ret == SQLITE_DONE) {
+		result = 0;
+		goto reset;
+	}
 
-	name_len = strlen(file->filename);
-	finfo.name_len = cpu_to_le16(name_len);
-	finfo.rec_len = cpu_to_le16(name_len + sizeof(struct file_info));
+	if (ret != SQLITE_ROW) {
+		fprintf(stderr, "select_file: %s\n", sqlite3_errstr(ret));
+		result = -1;
+		goto reset;
+	}
 
-	written = write(fd, &finfo, sizeof(struct file_info));
-	if (written == -1)
-		return errno;
-	if (written != sizeof(struct file_info))
-		return EIO;
+	*id = (uint64_t)sqlite3_column_int64(sel_file_stmt, 0);
+	*inum = (uint64_t)sqlite3_column_int64(sel_file_stmt, 1);
+	*subvolid = (uint64_t)sqlite3_column_int64(sel_file_stmt, 2);
+	*filename = sqlite3_column_text(sel_file_stmt, 4);
+	goto out;
 
-	n = file->filename;
-
-	written = write(fd, n, name_len);
-	if (written == -1)
-		return errno;
-	if (written != name_len)
-		return EIO;
-
-	return 0;
+reset:
+	sqlite3_reset(sel_file_stmt);
+out:
+	return result;
 }
 
-int write_one_hash(int fd, uint64_t loff, uint32_t flags,
-			  unsigned char *digest)
+static int select_hash(uint64_t fileid, const unsigned char **digest,
+		       uint32_t *flags, uint64_t *loff)
 {
-	int written;
-	struct block_hash disk_block = { 0, };
+	int ret, result = 1;
 
-	disk_block.loff = cpu_to_le64(loff);
-	disk_block.flags = cpu_to_le32(flags);
-	BUILD_BUG_ON(DISK_DIGEST_LEN < DIGEST_LEN_MAX);
-	memcpy(&disk_block.digest, digest, DISK_DIGEST_LEN);
+	ret = sqlite3_step(sel_hash_stmt);
+	if (ret == SQLITE_DONE) {
+		result = 0;
+		goto reset;
+	}
 
-	written = write(fd, &disk_block, sizeof(struct block_hash));
-	if (written == -1)
-		return errno;
-	if (written != sizeof(struct block_hash))
-		return EIO;
+	if (ret != SQLITE_ROW) {
+		fprintf(stderr, "select_hash: %s\n", sqlite3_errstr(ret));
+		result = -1;
+		goto reset;
+	}
 
-	return 0;
+	*digest = sqlite3_column_text(sel_hash_stmt, 0);
+	*flags = (uint32_t)sqlite3_column_int64(sel_hash_stmt, 1);
+	*loff = (uint64_t)sqlite3_column_int64(sel_hash_stmt, 2);
+	goto out;
+
+reset:
+	sqlite3_reset(sel_hash_stmt);
+out:
+	return result;
 }
 
-int serialize_hash_tree(char *filename, struct hash_tree *tree,
-			unsigned int block_size)
+static int read_one_file(struct hash_tree *tree, struct rb_root *scan_tree,
+			 struct filerec *file, uint64_t id)
 {
-	int ret, fd;
-	struct filerec *file;
-	struct file_block *block;
-	uint64_t tot_files, tot_hashes;
+	int ret;
+	uint32_t flags;
+	uint64_t loff;
+	const unsigned char *digest;
+	int result = 0;
 
-	fd = open(filename, O_WRONLY|O_CREAT|O_TRUNC, 0644);
-	if (fd == -1)
-		return errno;
-
-	/* Write the header first with zero files */
-	ret = write_header(fd, 0, 0, block_size);
-	if (ret)
+	dprintf("Reading hashes with fileid = %"PRIu64"\n", id);
+        ret = sqlite3_bind_int64(sel_hash_stmt, 1, (sqlite3_int64)id);
+        if (ret != SQLITE_OK) {
+                fprintf(stderr, "failed to bind fileid: %s\n", sqlite3_errstr(ret));
+		result = -1;
 		goto out;
+        }
 
-	tot_files = tot_hashes = 0;
-	list_for_each_entry(file, &filerec_list, rec_list) {
-		if (list_empty(&file->block_list))
-			continue;
-
-		ret = write_file_info(fd, file);
-		if (ret)
+	while(true) {
+		ret = select_hash(id, &digest, &flags, &loff);
+		if (ret == -1) {
+			result = -1;
 			goto out;
-		tot_files++;
+		}
 
-		/* Now write each one of this files hashes */
-		list_for_each_entry(block, &file->block_list, b_file_next) {
-			tot_hashes++;
-			ret = write_one_hash(fd, block->b_loff, block->b_flags,
-					     block->b_parent->dl_hash);
-			if (ret)
+		if (ret == 0)
+			goto out;
+
+		if (ret == 1) {
+			if (!tree) { /* First pass */
+				ret = bloom_add(&bloom, digest, DIGEST_LEN_MAX);
+				if (ret == 1) {
+					ret = digest_insert(scan_tree, digest);
+					if (ret)
+						return ret;
+				}
+				continue;
+			}
+
+			/* 2nd pass */
+			if (scan_tree && !digest_find(scan_tree, digest))
+				continue;
+
+			ret = insert_hashed_block(tree, digest, file, loff, flags);
+			if (ret) {
+				result = ENOMEM;
 				goto out;
+			}
 		}
 	}
-
-	/* When we're done, rewrite the header */
-	ret = write_header(fd, tot_files, tot_hashes, block_size);
 
 out:
-	close(fd);
-	return ret;
+	sqlite3_reset(sel_hash_stmt);
+	return result;
 }
 
-static int read_file(int fd, struct file_info *f, char *fname)
+static int read_header(struct db_header *h)
 {
-	int ret, name_len;
-
-	ret = read(fd, f, sizeof(struct file_info));
-	if (ret == -1)
-		return errno;
-	if (ret < sizeof(struct file_info)) {
-		/* We reached EOF when we expected to have more files
-		 * to read in */
-		return EIO;
-	}
-	name_len = le16_to_cpu(f->name_len);
-
-	ret = read(fd, fname, name_len);
-	if (ret == -1)
-		return errno;
-	if (ret != name_len)
-		return EIO;
-
-	fname[name_len] = '\0';
-
-	return 0;
-}
-
-static int read_hash(int fd, struct block_hash *b)
-{
+	char *sql;
+	sqlite3_stmt *stmt;
 	int ret;
+	const unsigned char *version;
 
-	ret = read(fd, b, sizeof(struct block_hash));
-	if (ret == -1)
-		return errno;
-	if (ret != sizeof(struct block_hash))
-		return EIO;
+	sql = "select value from config where key = ?";
+	ret = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+	ret |= sqlite3_bind_text(stmt, 1, "version", 7, 0);
+	ret |= sqlite3_step(stmt);
+	if (ret != (SQLITE_OK | SQLITE_ROW))
+		goto out;
 
-	return 0;
-}
-
-static int read_one_file(int fd, struct hash_tree *tree,
-				struct rb_root *scan_tree)
-{
-	int ret;
-	uint32_t i;
-	uint64_t num_blocks;
-	struct file_info finfo = {0, };
-	struct block_hash bhash;
-	struct filerec *file;
-	char fname[PATH_MAX+1];
-
-	ret = read_file(fd, &finfo, fname);
-	if (ret)
-		return ret;
-
-	num_blocks = le64_to_cpu(finfo.num_blocks);
-
-	dprintf("Load %"PRIu64" hashes for \"%s\"\n", num_blocks, fname);
-
-	file = filerec_new(fname, le64_to_cpu(finfo.ino),
-			   le64_to_cpu(finfo.subvolid));
-	if (file == NULL)
-		return ENOMEM;
-
-	for (i = 0; i < num_blocks; i++) {
-		ret = read_hash(fd, &bhash);
-		if (ret)
-			return ret;
-
-		if (!tree) { /* First pass */
-			ret = bloom_add(&bloom, (const unsigned char *)bhash.digest,
-					DIGEST_LEN_MAX);
-			if (ret == 1) {
-				ret = digest_insert(scan_tree,
-					    ((unsigned char *)bhash.digest));
-				if (ret)
-					return ret;
-			}
-			continue;
-		}
-
-		/* 2nd pass */
-		if (scan_tree && !digest_find(scan_tree, (unsigned char *)bhash.digest))
-			continue;
-
-		ret = insert_hashed_block(tree, (unsigned char *)bhash.digest,
-					  file, le64_to_cpu(bhash.loff),
-					  le32_to_cpu(bhash.flags));
-		if (ret)
-			return ENOMEM;
+	version = sqlite3_column_text(stmt, 0);
+	if (strcmp((char *)version, DB_VERSION) != 0) {
+		fprintf(stderr, "Version mismatch (found %s, I have %s)\n", 
+				version, DB_VERSION);
+		goto clean;
 	}
 
+	sqlite3_reset(stmt);
+	ret = sqlite3_bind_text(stmt, 1, "blocksize", 9, 0);
+	ret |= sqlite3_step(stmt);
+	if (ret != (SQLITE_OK | SQLITE_ROW))
+		goto out;
+
+	h->block_size = (uint32_t)sqlite3_column_int64(stmt, 0);
+	sqlite3_reset(stmt);
+	sqlite3_finalize(stmt);
+
+	sql = "select count(*) from file_info";
+	ret = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+	ret |= sqlite3_step(stmt);
+	if (ret != (SQLITE_OK | SQLITE_ROW))
+		goto out;
+	
+	h->num_files = (uint64_t)sqlite3_column_int64(stmt, 0);
+	sqlite3_finalize(stmt);
+
+	sql = "select count(*) from hashes";
+	ret = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+	ret |= sqlite3_step(stmt);
+	if (ret != (SQLITE_OK | SQLITE_ROW))
+		goto out;
+	
+	h->num_hashes = (uint64_t)sqlite3_column_int64(stmt, 0);
+	sqlite3_finalize(stmt);
 	return 0;
+
+out:
+	/* data missing or error. Successful select returns SQLITE_ROW */
+	if (ret == SQLITE_DONE)
+		fprintf(stderr, "read_header: data not found\n");
+	else
+		fprintf(stderr, "read_header: %s (%i)\n", sqlite3_errstr(ret), ret);
+clean:
+	sqlite3_finalize(stmt);
+	return -1;
 }
 
-static int read_header(int fd, struct hash_file_header *h)
-{
-	int ret;
-
-	ret = read(fd, h, sizeof(*h));
-	if (ret == -1)
-		return errno;
-	if (ret != sizeof(struct hash_file_header))
-		return EIO;
-
-	debug_print_header(h);
-
-	return 0;
-}
 
 int read_hash_tree(char *filename, struct hash_tree *tree,
-		   unsigned int *block_size, struct hash_file_header *ret_hdr,
+                   unsigned int *block_size, struct db_header *ret_hdr,
 		   int ignore_hash_type, struct rb_root *scan_tree)
 {
-	int ret, fd;
-	uint32_t i;
-	uint64_t num_files;
-	struct hash_file_header h;
+	int ret;
+	uint64_t id, inum, subvolid;
+	const unsigned char *file_path;
+	struct filerec *file;
+	int result = 0;
+	struct db_header h;
 
-	memset(&h, 0, sizeof(struct hash_file_header));
-
-	fd = open(filename, O_RDONLY);
-	if (fd == -1)
-		return errno;
-
-	ret = read_header(fd, &h);
+	ret = read_header(&h);
 	if (ret)
-		return ret;
+		return -1;
 
-	if (memcmp(h.magic, HASH_FILE_MAGIC, 8)) {
-		ret = FILE_MAGIC_ERROR;
-		goto out;
-	}
-	if (le64_to_cpu(h.major) > HASH_FILE_MAJOR) {
-		ret = FILE_VERSION_ERROR;
-		goto out;
-	}
-
-	if (!ignore_hash_type) {
-		uint64_t minor = le64_to_cpu(h.minor);
-		/*
-		 * v1.0 hash files were SHA256 but wrote out hash_type
-		 * as nulls
-		 */
-		if (minor == 0 && memcmp(hash_type_v1_0, h.hash_type, 8)) {
-			ret = FILE_HASH_TYPE_ERROR;
-			memcpy(unknown_hash_type, hash_type_v1_0, 8);
-			goto out;
-		} else  if (minor > 0 && memcmp(h.hash_type, hash_type, 8)) {
-			ret = FILE_HASH_TYPE_ERROR;
-			memcpy(unknown_hash_type, h.hash_type, 8);
-			goto out;
-		}
-	}
-
-	*block_size = le32_to_cpu(h.block_size);
-	num_files = le64_to_cpu(h.num_files);
-
-	dprintf("Load %"PRIu64" files from \"%s\"\n",
-		num_files, filename);
+	if (ret_hdr)
+		memcpy(ret_hdr, &h, sizeof(struct db_header));
 
 	if (tree == NULL && scan_tree != NULL) {
 		ret = bloom_init(&bloom, h.num_hashes, 0.01);
@@ -377,35 +418,60 @@ int read_hash_tree(char *filename, struct hash_tree *tree,
 		printf("Bloom init completed\n");
 	}
 
-	for (i = 0; i < num_files; i++) {
-		ret = read_one_file(fd, tree, scan_tree);
-		if (ret)
-			break;
+	while(true) {
+		ret = select_file(&id, &inum, &subvolid, &file_path);
+		if (ret == -1) {
+			result = -1;
+			goto out;
+		}
+
+		if (ret == 0)
+			goto out;
+
+		if (ret == 1) {
+			dprintf("%"PRIu64", %"PRIu64", %"PRIu64", %s\n", id, inum, subvolid, file_path);
+			file = filerec_new((char *)file_path, inum, subvolid);
+			read_one_file(tree, scan_tree, file, id);
+		}
 	}
+
 out:
-	if (ret == 0 && ret_hdr)
-		memcpy(ret_hdr, &h, sizeof(struct hash_file_header));
-	return ret;
+	sqlite3_reset(sel_file_stmt);
+	return result;
 }
 
-void print_hash_tree_errcode(FILE *io, char *filename, int ret)
+int write_header(uint32_t block_size)
 {
-	switch (ret) {
-	case FILE_VERSION_ERROR:
-		fprintf(io,
-			"Hash file \"%s\": Version mismatch (mine: %d.%d).\n",
-			filename, HASH_FILE_MAJOR, HASH_FILE_MINOR);
-		break;
-	case FILE_MAGIC_ERROR:
-		fprintf(io, "Hash file \"%s\": Bad magic.\n", filename);
-		break;
-	case FILE_HASH_TYPE_ERROR:
-		fprintf(io, "Hash file \"%s\": Unkown hash type \"%.*s\".\n "
-			"(we use \"%.*s\").\n", filename, 8, unknown_hash_type,
-			8, hash_type);
-		break;
-	default:
-		fprintf(io, "Hash file \"%s\": Error %d while reading: %s.\n",
-			filename, ret, strerror(ret));
-	}
+	char *sql;
+	sqlite3_stmt *stmt;
+	int ret;
+
+	sql = "insert into config(key, value) values(?, ?)";
+	ret = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+	if (ret != SQLITE_OK)
+		goto err;
+
+	ret = sqlite3_bind_text(stmt, 1, "version", 7, 0);
+	ret |= sqlite3_bind_text(stmt, 2, DB_VERSION, strlen(DB_VERSION), 0);
+	ret |= sqlite3_step(stmt);
+
+	if (ret != (SQLITE_OK | SQLITE_DONE))
+		goto err;
+
+	sqlite3_reset(stmt);
+
+	ret = sqlite3_bind_text(stmt, 1, "blocksize", 9, 0);
+	ret |= sqlite3_bind_int64(stmt, 2, (sqlite3_int64)block_size);
+	ret |= sqlite3_step(stmt);
+
+	if (ret != (SQLITE_OK | SQLITE_DONE))
+		goto err;
+
+	sqlite3_finalize(stmt);
+	return 0;
+
+err:
+	fprintf(stderr, "write_header: %s\n", sqlite3_errstr(ret));
+	sqlite3_finalize(stmt);
+	return -1;
 }

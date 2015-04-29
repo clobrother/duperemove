@@ -324,6 +324,7 @@ int main(int argc, char **argv)
 	printf("Using %uK blocks\n", blocksize / 1024);
 	printf("Using hash: %s\n", csum_mod->name);
 
+	init_db();
 	switch (use_hashfile) {
 	case H_WRITE:
 	case H_UPDATE:
@@ -336,9 +337,6 @@ int main(int argc, char **argv)
 		 */
 		ret = read_hash_tree(serialize_fname, NULL, &blocksize,
 				     NULL, 0, &digest_tree);
-		if (ret)
-			print_hash_tree_errcode(stderr, serialize_fname,
-						ret);
 		break;
 	case H_NONE:
 		ret = populate_tree_aim(&scan_tree);
@@ -376,10 +374,8 @@ int main(int argc, char **argv)
 		init_hash_tree(&dups_tree);
 		ret = read_hash_tree(serialize_fname, &dups_tree, &blocksize,
 				     NULL, 0, &digest_tree);
-		if (ret) {
-			print_hash_tree_errcode(stderr, serialize_fname, ret);
+		if (ret)
 			goto out;
-		}
 
 		ret = find_all_dupes(&dups_tree, &res);
 	}

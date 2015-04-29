@@ -57,7 +57,6 @@ struct thread_params {
 	int num_files;           /* Total number of files we hashed */
 	int num_hashes;          /* Total number of hashes we hashed */
 	unsigned int bloom_match;/* Total number of matched by bloom */
-	int hfile;               /* fd to the swap-file */
 	struct bloom bloom;      /* the real bloom filter */
 };
 
@@ -539,7 +538,7 @@ static void csum_whole_file_swap(struct filerec *file,
 	 */
 	g_mutex_lock(mutex);
 	file->num_blocks = nb_hash;
-	ret = write_file_info(params->hfile, file);
+	ret = write_file_info(file);
 	if (ret)
 		goto err;
 
@@ -554,8 +553,8 @@ static void csum_whole_file_swap(struct filerec *file,
 			matched++;
 		}
 
-		ret = write_one_hash(params->hfile, hashes[i].loff,
-				hashes[i].flags, hashes[i].digest);
+		ret = write_one_hash(hashes[i].loff, hashes[i].flags,
+				     hashes[i].digest);
 		if (ret)
 			goto err;
 	}
@@ -631,13 +630,6 @@ int populate_tree_swap(struct rb_root *tree, char *serialize_fname)
 
 	struct thread_params params = { tree, 0, 0, 0, };
 
-	params.hfile = open(serialize_fname, O_WRONLY|O_CREAT|O_TRUNC, 0644);
-
-	/* Write a dummy header */
-	ret = write_header(params.hfile, 0, 0, blocksize);
-	if (ret)
-		goto out;
-
 	ret = bloom_init(&params.bloom, walked_size / blocksize, 0.01);
 	if (ret)
 		goto out;
@@ -648,11 +640,11 @@ int populate_tree_swap(struct rb_root *tree, char *serialize_fname)
 		goto out;
 	}
 
+	db_begin_transac();
 	run_pool(pool);
+	db_commit();
 
-	/* Now, write the real header */
-	ret = write_header(params.hfile, params.num_files,
-			params.num_hashes, blocksize);
+	ret = write_header(blocksize);
 	if (ret)
 		goto out;
 
@@ -662,7 +654,6 @@ int populate_tree_swap(struct rb_root *tree, char *serialize_fname)
 
 out:
 	bloom_free(&params.bloom);
-	close(params.hfile);
 	g_dataset_destroy(&params);
 
 	return ret;
