@@ -191,7 +191,7 @@ static void insert_block_list(struct hash_tree *tree,
 }
 
 static struct dupe_blocks_list *find_block_list(struct hash_tree *tree,
-					       unsigned char *digest)
+					       const unsigned char *digest)
 {
 	struct rb_node *n = tree->root.rb_node;
 	struct dupe_blocks_list *list;
@@ -210,7 +210,7 @@ static struct dupe_blocks_list *find_block_list(struct hash_tree *tree,
 	return NULL;
 }
 
-int insert_hashed_block(struct hash_tree *tree,	unsigned char *digest,
+int insert_hashed_block(struct hash_tree *tree,	const unsigned char *digest,
 			struct filerec *file, uint64_t loff, unsigned int flags)
 {
 	struct file_block *e = malloc_file_block();

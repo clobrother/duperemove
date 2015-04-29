@@ -1,6 +1,11 @@
 #ifndef __HASH_TREE__
 #define __HASH_TREE__
 
+#include <stdint.h>
+#include "rbtree.h"
+#include "list.h"
+#include "csum.h"
+
 struct hash_tree {
 	struct rb_root	root;
 	uint64_t	num_blocks;
@@ -44,7 +49,7 @@ struct file_block {
 	struct list_head	b_head_list; /* file_hash_head->h_blocks */
 };
 
-int insert_hashed_block(struct hash_tree *tree, unsigned char *digest,
+int insert_hashed_block(struct hash_tree *tree, const unsigned char *digest,
 			struct filerec *file, uint64_t loff, unsigned int flags);
 void remove_hashed_blocks(struct hash_tree *tree, struct filerec *file);
 
