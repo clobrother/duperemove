@@ -643,6 +643,8 @@ int populate_tree_swap(struct rb_root *tree, char *serialize_fname)
 	db_begin_transac();
 	run_pool(pool);
 	db_commit();
+	if (create_index())
+		goto out;
 
 	ret = write_header(blocksize);
 	if (ret)

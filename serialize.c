@@ -159,6 +159,12 @@ int init_db(char *filename)
 		|| compile_stmt() || atexit(close_db));
 }
 
+int create_index(void)
+{
+	char *sql = "create index if not exists hash_fileid on hashes(file_id)";
+	return exec_query(sql);
+}
+
 int write_file_info(struct filerec *file)
 {
 	int ret, result = 0;
