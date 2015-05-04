@@ -103,7 +103,6 @@ static void free_stmt(void)
 	sqlite3_finalize(ins_hash_stmt);
 	sqlite3_finalize(ins_file_stmt);
 	sqlite3_finalize(sel_hash_stmt);
-	sqlite3_finalize(sel_file_stmt);
 }
 
 static int compile_stmt(void)
@@ -118,15 +117,12 @@ static int compile_stmt(void)
 			      file_id, digest, flags, loff)\
 			      values(?, ?, ?, ?);";
 
-	char *sel_hash_sql = "select digest, flags, loff\
-			      from hashes where file_id = ?";
-	char *sel_file_sql = "select id, inum, subvolid, num_blocks, filename\
-			      from file_info";
+	char *sel_hash_sql = "select digest, flags, loff, inum, subvolid, filename\
+			      from hashes, file_info where hashes.file_id = file_info.id";
 
 	ret = sqlite3_prepare_v2(db, ins_hash_sql, -1, &ins_hash_stmt, NULL);
 	ret |= sqlite3_prepare_v2(db, ins_file_sql, -1, &ins_file_stmt, NULL);
 	ret |= sqlite3_prepare_v2(db, sel_hash_sql, -1, &sel_hash_stmt, NULL);
-	ret |= sqlite3_prepare_v2(db, sel_file_sql, -1, &sel_file_stmt, NULL);
 	if (ret == SQLITE_OK)
 		return 0;
 
@@ -157,12 +153,6 @@ int init_db(char *filename)
 {
 	return (open_db(filename) || burst_db() || create_tables()
 		|| compile_stmt() || atexit(close_db));
-}
-
-int create_index(void)
-{
-	char *sql = "create index if not exists hash_fileid on hashes(file_id)";
-	return exec_query(sql);
 }
 
 int write_file_info(struct filerec *file)
@@ -222,37 +212,8 @@ out:
 	return ret;
 }
 
-static int select_file(uint64_t *id, uint64_t *inum, uint64_t *subvolid,
-		       const unsigned char **filename)
-{
-	int ret, result = 1;
-
-	ret = sqlite3_step(sel_file_stmt);
-	if (ret == SQLITE_DONE) {
-		result = 0;
-		goto reset;
-	}
-
-	if (ret != SQLITE_ROW) {
-		fprintf(stderr, "select_file: %s\n", sqlite3_errstr(ret));
-		result = -1;
-		goto reset;
-	}
-
-	*id = (uint64_t)sqlite3_column_int64(sel_file_stmt, 0);
-	*inum = (uint64_t)sqlite3_column_int64(sel_file_stmt, 1);
-	*subvolid = (uint64_t)sqlite3_column_int64(sel_file_stmt, 2);
-	*filename = sqlite3_column_text(sel_file_stmt, 4);
-	goto out;
-
-reset:
-	sqlite3_reset(sel_file_stmt);
-out:
-	return result;
-}
-
-static int select_hash(uint64_t fileid, const unsigned char **digest,
-		       uint32_t *flags, uint64_t *loff)
+static int select_hash(uint64_t *inum, uint64_t *subvolid, const unsigned char **filename,
+		       const unsigned char **digest, uint32_t *flags, uint64_t *loff)
 {
 	int ret, result = 1;
 
@@ -271,66 +232,15 @@ static int select_hash(uint64_t fileid, const unsigned char **digest,
 	*digest = sqlite3_column_text(sel_hash_stmt, 0);
 	*flags = (uint32_t)sqlite3_column_int64(sel_hash_stmt, 1);
 	*loff = (uint64_t)sqlite3_column_int64(sel_hash_stmt, 2);
+
+	*inum = (uint64_t)sqlite3_column_int64(sel_hash_stmt, 3);
+	*subvolid = (uint64_t)sqlite3_column_int64(sel_hash_stmt, 4);
+	*filename = sqlite3_column_text(sel_hash_stmt, 5);
 	goto out;
 
 reset:
 	sqlite3_reset(sel_hash_stmt);
 out:
-	return result;
-}
-
-static int read_one_file(struct hash_tree *tree, struct rb_root *scan_tree,
-			 struct filerec *file, uint64_t id)
-{
-	int ret;
-	uint32_t flags;
-	uint64_t loff;
-	const unsigned char *digest;
-	int result = 0;
-
-	dprintf("Reading hashes with fileid = %"PRIu64"\n", id);
-        ret = sqlite3_bind_int64(sel_hash_stmt, 1, (sqlite3_int64)id);
-        if (ret != SQLITE_OK) {
-                fprintf(stderr, "failed to bind fileid: %s\n", sqlite3_errstr(ret));
-		result = -1;
-		goto out;
-        }
-
-	while(true) {
-		ret = select_hash(id, &digest, &flags, &loff);
-		if (ret == -1) {
-			result = -1;
-			goto out;
-		}
-
-		if (ret == 0)
-			goto out;
-
-		if (ret == 1) {
-			if (!tree) { /* First pass */
-				ret = bloom_add(&bloom, digest, DIGEST_LEN_MAX);
-				if (ret == 1) {
-					ret = digest_insert(scan_tree, digest);
-					if (ret)
-						return ret;
-				}
-				continue;
-			}
-
-			/* 2nd pass */
-			if (scan_tree && !digest_find(scan_tree, digest))
-				continue;
-
-			ret = insert_hashed_block(tree, digest, file, loff, flags);
-			if (ret) {
-				result = ENOMEM;
-				goto out;
-			}
-		}
-	}
-
-out:
-	sqlite3_reset(sel_hash_stmt);
 	return result;
 }
 
@@ -401,11 +311,15 @@ int read_hash_tree(char *filename, struct hash_tree *tree,
 		   int ignore_hash_type, struct rb_root *scan_tree)
 {
 	int ret;
-	uint64_t id, inum, subvolid;
+	uint64_t inum, subvolid;
 	const unsigned char *file_path;
 	struct filerec *file;
 	int result = 0;
 	struct db_header h;
+
+	uint32_t flags;
+	uint64_t loff;
+	const unsigned char *digest;
 
 	ret = read_header(&h);
 	if (ret)
@@ -422,7 +336,9 @@ int read_hash_tree(char *filename, struct hash_tree *tree,
 	}
 
 	while(true) {
-		ret = select_file(&id, &inum, &subvolid, &file_path);
+		ret = select_hash(&inum, &subvolid, &file_path, &digest, &flags, &loff);
+		dprintf("Debug: %"PRIu64", %"PRIu64", %s, %"PRIu32", %"PRIu64"\n",
+			inum, subvolid, file_path, flags, loff);
 		if (ret == -1) {
 			result = -1;
 			goto out;
@@ -432,13 +348,31 @@ int read_hash_tree(char *filename, struct hash_tree *tree,
 			goto out;
 
 		if (ret == 1) {
-			dprintf("%"PRIu64", %"PRIu64", %"PRIu64", %s\n", id, inum, subvolid, file_path);
+			if (!tree) { /* First pass */
+				ret = bloom_add(&bloom, digest, DIGEST_LEN_MAX);
+				if (ret == 1) {
+					ret = digest_insert(scan_tree, digest);
+					if (ret)
+						goto out;
+				}
+				continue;
+			}
+
+			/* 2nd pass */
+			if (scan_tree && !digest_find(scan_tree, digest))
+				continue;
+
 			file = filerec_new((char *)file_path, inum, subvolid);
-			read_one_file(tree, scan_tree, file, id);
+			ret = insert_hashed_block(tree, digest, file, loff, flags);
+			if (ret) {
+				result = ENOMEM;
+				goto out;
+			}
 		}
 	}
 
 out:
+	bloom_free(&bloom);
 	sqlite3_reset(sel_file_stmt);
 	return result;
 }
